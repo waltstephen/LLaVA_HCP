@@ -111,6 +111,58 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
 
+@dataclass
+class LLaVARLArguments:
+    """
+    仅存放 RL-GRPO 相关的额外参数，避免污染 transformers.TrainingArguments。
+    在 `train()` 里会把这些字段“动态并入” training_args，后续任何模块
+    都可像 `training_args.xxx` 一样访问。
+    """
+
+    # ---- 开关与核心 ----
+    rl_grpo: bool = field(
+        default=False,
+        metadata={"help": "开启 GRPO 强化学习；False=纯 SFT"},
+    )
+    rl_group_size: int = field(
+        default=4,
+        metadata={"help": "每个 prompt 采样的回答条数 (Group Size)"},
+    )
+
+    # ---- GRPO 型式 ----
+    grpo_mode: str = field(
+        default="soft",
+        metadata={
+            "help": "soft=Soft Ranking (w=softmax(r/τ)) | adv=Advantage ((r-μ)/σ)"
+        },
+    )
+    grpo_tau: float = field(
+        default=0.15,
+        metadata={"help": "Soft-ranking 温度 τ；越小权重越集中"},
+    )
+    grpo_clip: float = field(
+        default=5.0,
+        metadata={"help": "对权重/adv 做 [-clip, clip] 裁剪以抑制梯度爆炸"},
+    )
+
+    # ---- KL 正则 ----
+    kl_beta: float = field(
+        default=0.02,
+        metadata={
+            "help": "KL(π_new‖π_ref) 系数；=0 可关闭参考策略、节省显存"
+        },
+    )
+    sample_log_freq: int = field(
+        default=50,
+        metadata={"help": "每隔多少 global_step 记录一次生成样本；<=0 则关闭"},
+    )
+    sample_log_n: int = field(
+        default=4,
+        metadata={"help": "每次记录前多少条文本"},
+    )
+
+
+
 
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
@@ -789,8 +841,14 @@ def train(attn_implementation=None):
     global local_rank
 
     parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        (ModelArguments, DataArguments, TrainingArguments, LLaVARLArguments))
+    model_args, data_args, training_args, rl_args = parser.parse_args_into_dataclasses()
+
+    # ---------- 把 RL-GRPO 字段“注入” TrainingArguments ----------
+    # （这样 trainer / 其它模块都能通过 training_args.xxx 访问）
+    for k, v in vars(rl_args).items():
+        setattr(training_args, k, v)
+
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
@@ -912,7 +970,7 @@ def train(attn_implementation=None):
             model_args=model_args,
             fsdp=training_args.fsdp
         )
-        
+
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
@@ -958,10 +1016,56 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
+
+    #  projector类型应与模型保持一致
+    target_dtype = torch.bfloat16 if training_args.bf16 else (
+        torch.float16 if training_args.fp16 else torch.float32)
+
+    model.get_model().mm_projector.to(dtype=target_dtype)
+
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
+
+    # -------------------------------------------------------------
+    # 以下代码仅用于调试梯度存在情况
+    # -------------------------------------------------------------
+
+    # a) 冻结除 mm_projector 之外的所有权重，可选但能让观察更直观
+    # for n, p in model.named_parameters():
+    #     p.requires_grad = "mm_projector" in n
+
+    # b) 给 mm_projector 的每个参数挂一个 hook：反向时打印梯度范数
+    # def _mk_hook(name):
+    #     return lambda g: print(f"[grad-check] {name:30s} ‖g‖₂ = {g.norm():.4e}")
+    #
+    # for n, p in model.named_parameters():
+    #     if "mm_projector" in n:
+    #         p.register_hook(_mk_hook(n))
+    #
+    # # c) 手动取 1 个 batch，跑前向 / 反向
+    # batch = next(iter(trainer.get_train_dataloader()))
+    # for n, p in model.named_parameters():
+    #     if "mm_projector" in n:
+    #         print(n, p.requires_grad)
+    # loss = trainer.compute_loss(model, batch)  # 内部已把 batch 搬到 device
+    # loss.backward()
+    # for n, p in model.named_parameters():
+    #     if "mm_projector" in n:
+    #         print(n, p.requires_grad)
+    #
+    # print(f"[grad-check] loss = {loss.item():.4f}")
+    #
+    # # d) 若任何参数梯度为 None，会在下面报错；OK 则程序退出
+    # for n, p in model.named_parameters():
+    #     if "mm_projector" in n:
+    #         print(p.grad)
+    #
+    # print("[grad-check] ✅  mm_projector 收到有效梯度，开始正式训练...")
+    # exit()  # ← 体检通过后可删除整段代码或把 exit() 注释掉
+
+
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
