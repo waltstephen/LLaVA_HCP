@@ -44,15 +44,18 @@ class CLIPVisionTower(nn.Module):
 
     @torch.no_grad()
     def forward(self, images):
+
         if type(images) is list:
             image_features = []
             for image in images:
                 image_forward_out = self.vision_tower(image.to(device=self.device, dtype=self.dtype).unsqueeze(0), output_hidden_states=True)
-                image_feature = self.feature_select(image_forward_out).to(image.dtype)
+                image_feature = self.feature_select(image_forward_out)
+                # Keep vision tower dtype for consistency
                 image_features.append(image_feature)
         else:
             image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
-            image_features = self.feature_select(image_forward_outs).to(images.dtype)
+            image_features = self.feature_select(image_forward_outs)
+            # Keep vision tower dtype for consistency
 
         return image_features
 
@@ -127,7 +130,8 @@ class CLIPVisionTowerS2(CLIPVisionTower):
     @torch.no_grad()
     def forward_feature(self, images):
         image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
-        image_features = self.feature_select(image_forward_outs).to(images.dtype)
+        image_features = self.feature_select(image_forward_outs)
+        # Keep vision tower dtype for consistency
         return image_features
 
     @torch.no_grad()

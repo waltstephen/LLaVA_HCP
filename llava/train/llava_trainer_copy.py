@@ -245,54 +245,18 @@ class LLaVATrainer(Trainer):
             clean_up_tokenization_spaces=True,
         )
 
-        # ---------- 7. 奖励打分与惩罚机制 ----------
         with torch.no_grad():
-            # 7.1. 计算原始奖励分数
             raw_scores = []
             for rm in reward_models:
                 sc = rm.score(images_reward, texts).to(device)  # [B*G]
                 raw_scores.append(sc)
 
             clip_s, blip_s, dist_s = raw_scores
-            # (可选) 对多样性分数进行归一化，即使权重为0，计算出来也无妨
-            if dist_s.numel() > 1:  # 避免只有一个元素时 min()=max() 导致除以0
-                dist_s = (dist_s - dist_s.min()) / (dist_s.max() - dist_s.min() + 1e-6)
+            dist_s = (dist_s - dist_s.min()) / (dist_s.max() - dist_s.min() + 1e-6)
 
-            # 奖励权重
             w_clip, w_blip, w_dist = 0.6, 0.3, 0.0
-
-            # 计算组合后的初始奖励，保持为 [B*G] 的扁平形状
-            initial_rewards = (w_clip * clip_s + w_blip * blip_s + w_dist * dist_s).to(dtype=torch.float32)
-
-            # 7.2. 实施惩罚机制 (空回复/长度惩罚)
-            # --- 超参数 (可根据实验效果调整) ---
-            # 惩罚值应足够大，以显著拉低低质量回复的奖励
-            SHORT_REPLY_THRESHOLD = 8  # 长度低于此字符数的回复将受到惩罚
-            PENALTY_FACTOR_EMPTY = 0.0  # 空回复直接奖励为0
-            PENALTY_FACTOR_SHORT = 0.5  # 短回复奖励减半
-
-            penalty_factors_list = [
-                PENALTY_FACTOR_EMPTY if not s.strip() else
-                PENALTY_FACTOR_SHORT if len(s.strip()) < SHORT_REPLY_THRESHOLD else
-                1.0
-                for s in texts
-            ]
-
-            penalty_factors = torch.tensor(
-                penalty_factors_list,
-                device=initial_rewards.device,
-                dtype=initial_rewards.dtype
-            )
-
-            final_rewards = initial_rewards * penalty_factors
-            # 记录日志的部分也需要相应调整，可以记录 factor 的均值
-            self.log({
-                "reward_mean_before_penalty": initial_rewards.mean().item(),
-                "reward_penalty_factor_mean": penalty_factors.mean().item(),
-                "reward_penalty_count": (penalty_factors < 1.0).sum().item(),
-            })
-
-            rewards = final_rewards.view(B, G)
+            combined = w_clip * clip_s + w_blip * blip_s + w_dist * dist_s
+            rewards = combined.view(B, G).to(dtype=torch.float32)  # [B,G]
 
         # ---------- 8. Stable-GRPO + KL ----------
         loss, pol_loss, kl_loss = grpo_stable_loss(

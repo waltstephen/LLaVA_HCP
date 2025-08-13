@@ -31,5 +31,7 @@ ckpts*
 # DevContainer
 !.devcontainer/*
 
+/playground
+
 # Demo
 serve_images/
