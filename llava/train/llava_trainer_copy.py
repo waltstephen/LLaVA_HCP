@@ -300,15 +300,11 @@ class LLaVATrainer(Trainer):
             with open(path, "a", encoding="utf-8") as f:
                 f.write(samples + "\n")
 
-            # c) wandb（可选）
-            if "wandb" in (self.args.report_to or []):
+            # c) swanlab（可选）
+            if "swanlab" in (self.args.report_to or []):
                 try:
-                    import wandb
-                    wandb.log(
-                        {"samples": wandb.Html(samples.replace("\n", "<br>"))},
-                        step=self.state.global_step,
-                        commit=False,
-                    )
+                    import swanlab
+                    swanlab.log({"samples": samples}, step=self.state.global_step)
                 except ImportError:
                     pass
 

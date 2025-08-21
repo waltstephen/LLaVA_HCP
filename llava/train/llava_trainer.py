@@ -23,7 +23,13 @@ from rl_utils import (                               # 前文完整实现
     RewardModelDistinctiveness,
     generate_group_responses,
     compute_group_token_log_probs,
-    grpo_stable_loss,
+    # CaRPO 组件
+    CalibratedRewardAggregator,
+    KLController,
+    group_dpo_loss,
+    grpo_rl_loss,
+    estimate_true_kl_per_token,
+    compute_group_log_probs,
 )
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -166,17 +172,40 @@ class LLaVATrainer(Trainer):
 
         # ---------- 1. 超参 ----------
         G         = getattr(self.args, "rl_group_size", 4)
-        mode      = getattr(self.args, "grpo_mode",  "soft")     # "soft"|"adv"
-        tau       = getattr(self.args, "grpo_tau",   0.15)
-        clip_w    = getattr(self.args, "grpo_clip",  5.0)
-        kl_beta   = getattr(self.args, "kl_beta",    0.02)
+        # CaRPO / PR-MD 相关
+        mode      = getattr(self.args, "grpo_mode",  "adv")
+        tau       = getattr(self.args, "grpo_tau",   0.4)
+        clip_c    = getattr(self.args, "grpo_clip",  1.5)
+        # Rank-first
+        beta_rank = getattr(self.args, "beta_rank",  0.1)
+        pair_topk = getattr(self.args, "pair_topk",  1)
+        pair_cap  = getattr(self.args, "pair_cap",   2048)
+        # Aggregator
+        reward_alphas = torch.tensor(getattr(self.args, "reward_alphas", [0.6, 0.3, 0.1]), dtype=torch.float32)
+        risk_lambda   = getattr(self.args, "risk_lambda", 0.2)
+        ema_m         = getattr(self.args, "ema_m", 0.95)
+        agg_clamp     = getattr(self.args, "agg_clamp", None)
+        agg_use_tanh  = getattr(self.args, "agg_use_tanh", False)
+        # Penalty（加性）
+        short_threshold = getattr(self.args, "short_threshold", 8)
+        lambda_empty    = getattr(self.args, "lambda_empty", 1.0)
+        lambda_len      = getattr(self.args, "lambda_len", 0.05)
+        # KL 控制器
+        target_kl_token = getattr(self.args, "target_kl_token", 0.02)
+        kl_beta_min     = getattr(self.args, "kl_beta_min", 1e-4)
+        kl_beta_max     = getattr(self.args, "kl_beta_max", 0.5)
+        # Loss 组合
+        rank_warmup_steps = getattr(self.args, "rank_warmup_steps", 800)
+        rank_weight       = getattr(self.args, "rank_weight", 0.5)
+        rl_weight         = getattr(self.args, "rl_weight", 0.5)
 
         device = next(model.parameters()).device
         dtype  = next(model.parameters()).dtype
         pil_tf = transforms.ToPILImage()
 
         # ---------- 2. reference policy (懒加载一次) ----------
-        if kl_beta > 0 and not hasattr(self, "_ref_model"):
+        # 参考策略懒加载（需要 KL 正则 或 Rank-first DPO 的 reference）
+        if not hasattr(self, "_ref_model"):
             self._ref_model = copy.deepcopy(model if not hasattr(model, "module")
                                             else model.module).eval()
             for p in self._ref_model.parameters():
@@ -190,6 +219,27 @@ class LLaVATrainer(Trainer):
                 RewardModelDistinctiveness(group_size=G),
             ]
         reward_models = self._reward_models
+
+        # 奖励聚合器（跨步 EMA）
+        if not hasattr(self, "_reward_aggregator"):
+            self._reward_aggregator = CalibratedRewardAggregator(
+                K=len(reward_models),
+                alphas=reward_alphas.tolist(),
+                risk_lambda=risk_lambda,
+                ema_m=ema_m,
+                clamp=agg_clamp,
+                use_tanh=agg_use_tanh,
+            ).to(device)
+
+        # KL 控制器（持久化 beta）
+        if not hasattr(self, "_kl_controller"):
+            self._kl_controller = KLController(
+                target=target_kl_token,
+                beta_min=kl_beta_min,
+                beta_max=kl_beta_max,
+            )
+        if not hasattr(self, "_kl_beta_value"):
+            self._kl_beta_value = float(getattr(self.args, "kl_beta_init", 0.05))
 
         # ---------- 4. 处理 images ----------
         if "images" not in inputs:
@@ -206,8 +256,10 @@ class LLaVATrainer(Trainer):
             images_for_logp = base_pils
 
         # ---------- 5. 生成组回复 ----------
+        # 传入温度控制（允许 CLI 控制），并保留其它默认采样超参
+        gen_kwargs = {"temperature": float(getattr(self.args, "temperature", 1.0))}
         generations = generate_group_responses(
-            model, gen_inputs, num_return_sequences=G
+            model, gen_inputs, num_return_sequences=G, generation_kwargs=gen_kwargs
         )                                               # [B,G,L]
         B, _, L = generations.shape
 
@@ -221,16 +273,24 @@ class LLaVATrainer(Trainer):
         )                                               # [B,G,L]
 
         with torch.no_grad():
-            token_logp_ref = (
-                compute_group_token_log_probs(
-                    self._ref_model,
-                    generations,
-                    inputs["input_ids"],
-                    inputs.get("attention_mask", None),
-                    images_for_logp,
-                )
-                if kl_beta > 0 else None
+            token_logp_ref = compute_group_token_log_probs(
+                self._ref_model,
+                generations,
+                inputs["input_ids"],
+                inputs.get("attention_mask", None),
+                images_for_logp,
             )
+
+        # 句级 logp（仅生成段）
+        # seq_logp_new 需要梯度，不能放在 no_grad 中
+        seq_logp_new = compute_group_log_probs(
+            model, generations, inputs["input_ids"], inputs.get("attention_mask", None), images_for_logp
+        )  # [B,G]
+        
+        with torch.no_grad():
+            seq_logp_ref = compute_group_log_probs(
+                self._ref_model, generations, inputs["input_ids"], inputs.get("attention_mask", None), images_for_logp
+            )  # [B,G]
 
         # ---------- 7. 奖励打分 ----------
         # 让图片批次与文本批次同维度 (B*G)
@@ -245,75 +305,140 @@ class LLaVATrainer(Trainer):
             clean_up_tokenization_spaces=True,
         )
 
-        # ---------- 7. 奖励打分与惩罚机制 ----------
+        # ---------- 7. 奖励打分与校准融合（CaRPO） ----------
         with torch.no_grad():
-            # 7.1. 计算原始奖励分数
             raw_scores = []
             for rm in reward_models:
                 sc = rm.score(images_reward, texts).to(device)  # [B*G]
                 raw_scores.append(sc)
 
-            clip_s, blip_s, dist_s = raw_scores
-            # (可选) 对多样性分数进行归一化，即使权重为0，计算出来也无妨
-            if dist_s.numel() > 1:  # 避免只有一个元素时 min()=max() 导致除以0
-                dist_s = (dist_s - dist_s.min()) / (dist_s.max() - dist_s.min() + 1e-6)
+            # 堆叠为 [B,G,K]
+            s_bgk = torch.stack(raw_scores, dim=-1).view(B, G, -1).to(device=device, dtype=torch.float32)
+            fused, rm_var, z_bgk = self._reward_aggregator(s_bgk)  # [B,G], [B,G], [B,G,K]
 
-            # 奖励权重
-            w_clip, w_blip, w_dist = 0.6, 0.3, 0.0
+            # 加性惩罚：空/短
+            if short_threshold is not None and (lambda_empty > 0 or lambda_len > 0):
+                penalties = []
+                for s in texts:
+                    st = s.strip()
+                    if len(st) == 0:
+                        penalties.append(lambda_empty)
+                    elif len(st) < short_threshold:
+                        penalties.append(lambda_len * float(short_threshold - len(st)))
+                    else:
+                        penalties.append(0.0)
+                penalties = torch.tensor(penalties, device=fused.device, dtype=fused.dtype).view(B, G)
+                fused = fused - penalties
 
-            # 计算组合后的初始奖励，保持为 [B*G] 的扁平形状
-            initial_rewards = (w_clip * clip_s + w_blip * blip_s + w_dist * dist_s).to(dtype=torch.float32)
+            rewards = fused
 
-            # 7.2. 实施惩罚机制 (空回复/长度惩罚)
-            # --- 超参数 (可根据实验效果调整) ---
-            # 惩罚值应足够大，以显著拉低低质量回复的奖励
-            SHORT_REPLY_THRESHOLD = 8  # 长度低于此字符数的回复将受到惩罚
-            PENALTY_FACTOR_EMPTY = 0.0  # 空回复直接奖励为0
-            PENALTY_FACTOR_SHORT = 0.5  # 短回复奖励减半
-
-            penalty_factors_list = [
-                PENALTY_FACTOR_EMPTY if not s.strip() else
-                PENALTY_FACTOR_SHORT if len(s.strip()) < SHORT_REPLY_THRESHOLD else
-                1.0
-                for s in texts
-            ]
-
-            penalty_factors = torch.tensor(
-                penalty_factors_list,
-                device=initial_rewards.device,
-                dtype=initial_rewards.dtype
-            )
-
-            final_rewards = initial_rewards * penalty_factors
-            # 记录日志的部分也需要相应调整，可以记录 factor 的均值
-            self.log({
-                "reward_mean_before_penalty": initial_rewards.mean().item(),
-                "reward_penalty_factor_mean": penalty_factors.mean().item(),
-                "reward_penalty_count": (penalty_factors < 1.0).sum().item(),
-            })
-
-            rewards = final_rewards.view(B, G)
-
-        # ---------- 8. Stable-GRPO + KL ----------
-        loss, pol_loss, kl_loss = grpo_stable_loss(
-            token_logp_new=token_logp_new,
-            rewards=rewards,
-            token_logp_ref=token_logp_ref,
-            mode=mode,
-            tau=tau,
-            clip_w=clip_w,
-            kl_beta=kl_beta,
+        # ---------- 8. Rank-first：Group-DPO ----------
+        rank_loss, num_pairs = group_dpo_loss(
+            seq_logp_new=seq_logp_new,
+            seq_logp_ref=seq_logp_ref,
+            rewards_bg=rewards,
+            beta_rank=beta_rank,
+            topk=pair_topk,
+            pair_cap=pair_cap,
         )
 
+        # ---------- 9. PR-MD：RL + 受控 KL ----------
+        pg_loss, approx_kl, ess = grpo_rl_loss(
+            logp_new_bg=seq_logp_new,
+            logp_ref_bg=seq_logp_ref,
+            fused_bg=rewards,
+            mode=mode,
+            tau=tau,
+            clip_c=clip_c,
+            baseline="group_mean",
+        )
+
+        # True KL/token 估计与 β 自适应
+        gen_lengths = torch.full((B, G), token_logp_new.size(-1), device=device, dtype=torch.long)
+        kl_token = estimate_true_kl_per_token(token_logp_new, token_logp_ref, gen_lengths)
+        self._kl_beta_value = self._kl_controller.step(kl_token, self._kl_beta_value)
+
+        # ---------- 9.1 ESS 自适应稳定性控制：根据当前 ESS 调整温度 ----------
+        try:
+            B = int(generations.size(0))
+            ess_target_ratio = float(getattr(self.args, "ess_target_ratio", 0.6))
+            ess_tol = float(getattr(self.args, "ess_tolerance", 0.1))
+            temp = float(getattr(self.args, "temperature", 1.0))
+            t_min = float(getattr(self.args, "temperature_min", 0.3))
+            t_max = float(getattr(self.args, "temperature_max", 1.5))
+            t_up  = float(getattr(self.args, "temperature_up", 1.07))
+            t_dn  = float(getattr(self.args, "temperature_down", 0.93))
+            G_eff = int(getattr(self.args, "rl_group_size", G))
+            ess_target = max(1.0, ess_target_ratio * (B * G_eff))
+            if ess < (1.0 - ess_tol) * ess_target:
+                temp = min(t_max, temp * t_up)
+            elif ess > (1.0 + ess_tol) * ess_target:
+                temp = max(t_min, temp * t_dn)
+            # 将更新后的温度写回，影响后续 step 的生成
+            setattr(self.args, "temperature", float(temp))
+        except Exception:
+            pass
+
+        loss_rl = pg_loss + self._kl_beta_value * approx_kl
+
+        # 合成总损失（先排后推、支持 warmup）
+        step = int(getattr(self.state, "global_step", 0))
+        if step < rank_warmup_steps:
+            loss = rank_loss
+        else:
+            loss = rank_weight * rank_loss + rl_weight * loss_rl
+
         # ---------- 9. 日志 ----------
+        # ---------- 10. 日志 ----------
+        with torch.no_grad():
+            # KCE
+            kce = abs(kl_token - target_kl_token)
+            # RSD
+            rsd_val = float(self._reward_aggregator.rsd().detach().cpu().item())
+            # IRC（平均 Spearman，近似实现）
+            try:
+                z_flat = z_bgk.view(B * G, -1)  # [B·G,K]
+                ranks = z_flat.argsort(dim=0).argsort(dim=0).to(dtype=torch.float32)
+                ranks = (ranks - ranks.mean(dim=0, keepdim=True)) / (ranks.std(dim=0, keepdim=True) + 1e-6)
+                corr_mat = (ranks.t() @ ranks) / (ranks.size(0) - 1)
+                K = corr_mat.size(0)
+                irc = (corr_mat.sum() - torch.diag(corr_mat).sum()) / (K * (K - 1))
+                irc_val = float(irc.detach().cpu().item())
+            except Exception:
+                irc_val = 0.0
+            rm_var_mean = float(rm_var.mean().detach().cpu().item())
+
+        # 记录 RM 原始分数的统计（均值）与 fused 的统计
+        with torch.no_grad():
+            try:
+                rm_means = s_bgk.mean(dim=(0, 1))  # [K]
+                fused_mean = rewards.mean()
+                rm_logs = {f"rm{k}_mean": float(rm_means[k].detach().cpu().item()) for k in range(rm_means.numel())}
+            except Exception:
+                rm_logs = {}
+                fused_mean = float("nan")
+
         log_dict = {
-            "policy_loss": pol_loss.item(),
-            "kl_loss":     kl_loss.item(),
-            "reward_mean": rewards.mean().item(),
-            "rm0_clip":    clip_s.mean().item(),
-            "rm1_blip":    blip_s.mean().item(),
-            "rm2_dist":    dist_s.mean().item(),
+            "loss_total": float(loss.detach().cpu().item()),
+            "loss_rank": float(rank_loss.detach().cpu().item()),
+            "loss_pg": float(pg_loss.detach().cpu().item()),
+            "approx_kl": float(approx_kl.detach().cpu().item()),
+            "kl_beta": float(self._kl_beta_value),
+            "kl_token": float(kl_token),
+            "kce": float(kce),
+            "ess": float(ess),
+            "temperature": float(getattr(self.args, "temperature", 1.0)),
+            "fused_reward_mean": float(fused_mean),
+            "num_pairs": int(num_pairs),
+            "rm_var_mean": rm_var_mean,
+            "rsd": rsd_val,
+            "irc": irc_val,
         }
+        # 合并 RM 均值日志
+        try:
+            log_dict.update(rm_logs)
+        except Exception:
+            pass
         self.log(log_dict)
 
         # ---------- 9.1 额外可读样本日志 ----------
@@ -336,15 +461,12 @@ class LLaVATrainer(Trainer):
             with open(path, "a", encoding="utf-8") as f:
                 f.write(samples + "\n")
 
-            # c) wandb（可选）
-            if "wandb" in (self.args.report_to or []):
+            # c) swanlab（可选）
+            if "swanlab" in (self.args.report_to or []):
                 try:
-                    import wandb
-                    wandb.log(
-                        {"samples": wandb.Html(samples.replace("\n", "<br>"))},
-                        step=self.state.global_step,
-                        commit=False,
-                    )
+                    import swanlab
+                    # 以纯文本形式记录可读样本
+                    swanlab.log({"samples": samples}, step=self.state.global_step)
                 except ImportError:
                     pass
 

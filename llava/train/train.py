@@ -152,6 +152,38 @@ class LLaVARLArguments:
             "help": "KL(π_new‖π_ref) 系数；=0 可关闭参考策略、节省显存"
         },
     )
+    # ---- CaRPO / Rank-first / KL 控制 / 稳定性 ----
+    beta_rank: float = field(default=0.1)
+    pair_topk: int = field(default=1)
+    pair_cap: int = field(default=2048)
+    # Aggregation
+    reward_alphas: List[float] = field(default_factory=lambda: [0.6, 0.3, 0.1])
+    risk_lambda: float = field(default=0.2)
+    ema_m: float = field(default=0.95)
+    agg_clamp: Optional[float] = field(default=None)
+    agg_use_tanh: bool = field(default=False)
+    # Loss 组合
+    rank_warmup_steps: int = field(default=800)
+    rank_weight: float = field(default=0.5)
+    rl_weight: float = field(default=0.5)
+    # KL 控制器
+    kl_beta_init: float = field(default=0.05)
+    target_kl_token: float = field(default=0.02)
+    kl_beta_min: float = field(default=1e-4)
+    kl_beta_max: float = field(default=0.5)
+    # 惩罚（加性）
+    short_threshold: int = field(default=8)
+    lambda_empty: float = field(default=1.0)
+    lambda_len: float = field(default=0.05)
+    # 生成与采样
+    temperature: float = field(default=0.7)
+    # ESS 自适应稳定性控制
+    ess_target_ratio: float = field(default=0.6, metadata={"help": "目标 ESS 占比，相对 B*G"})
+    temperature_min: float = field(default=0.3)
+    temperature_max: float = field(default=1.5)
+    temperature_up: float = field(default=1.07, metadata={"help": "ESS 偏低时温度乘子"})
+    temperature_down: float = field(default=0.93, metadata={"help": "ESS 偏高时温度乘子"})
+    ess_tolerance: float = field(default=0.1, metadata={"help": "ESS 目标的相对容忍度，比如 0.1 表示 ±10%"})
     sample_log_freq: int = field(
         default=50,
         metadata={"help": "每隔多少 global_step 记录一次生成样本；<=0 则关闭"},
@@ -195,9 +227,10 @@ def get_peft_state_maybe_zero_3(named_params, bias):
                 lora_bias_names.add(bias_name)
             elif "bias" in k:
                 maybe_lora_bias[k] = t
-        for k, t in maybe_lora_bias:
-            if bias_name in lora_bias_names:
-                to_return[bias_name] = t
+        # 将与 LoRA 对应的原始 bias 一并保存
+        for k, t in maybe_lora_bias.items():
+            if k in lora_bias_names:
+                to_return[k] = t
     else:
         raise NotImplementedError
     to_return = {k: maybe_zero_3(v, ignore_status=True) for k, v in to_return.items()}
@@ -848,6 +881,21 @@ def train(attn_implementation=None):
     # （这样 trainer / 其它模块都能通过 training_args.xxx 访问）
     for k, v in vars(rl_args).items():
         setattr(training_args, k, v)
+
+    # ---------- SwanLab 集成兼容 ----------
+    # 若用户通过 CLI 传入了 report_to=swanlab，但本地 transformers 版本 < 4.50.0，
+    # 直接传给 Trainer 会报错，此处改为先禁用报告，再通过 Callback 接入 SwanLab
+    transformers_version = version.parse(transformers.__version__)
+    wants_swanlab = False
+    if isinstance(training_args.report_to, (list, tuple)):
+        wants_swanlab = any(str(x).lower() == "swanlab" for x in training_args.report_to)
+    elif isinstance(training_args.report_to, str):
+        wants_swanlab = training_args.report_to.lower() == "swanlab"
+
+    use_swanlab_callback = False
+    if wants_swanlab and transformers_version < version.parse("4.50.0"):
+        print("swanlab only support transformers >= 4.50.0")
+        use_swanlab_callback = True
 
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
