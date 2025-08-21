@@ -19,7 +19,7 @@ deepspeed llava/train/train_mem.py \
     --data_path /path/to/pretrain_data.json \
     --image_folder /path/to/images \
     --vision_tower openai/clip-vit-large-patch14 \
-    --tune_mm_mlp_adapter True \
+    --tune_mm_mlp_adapter False \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \

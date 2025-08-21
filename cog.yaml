@@ -28,6 +28,7 @@ build:
     - "torchvision==0.15.2"
     - "transformers==4.31.0"
     - "wandb==0.15.12"
+    - "swanlab"
     - "wavedrom==2.0.3.post3"
     - "Pygments==2.16.1"
   run:

@@ -1,12 +1,14 @@
 # rl_utils.py   (Transformers ≥4.37.2, DataParallel-safe)
 # =============================================================================
 from __future__ import annotations
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Tuple
 
 import copy
+import random
 import torch, torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+import torch.distributed as dist
 from transformers import (
     CLIPProcessor,
     CLIPModel,
@@ -98,21 +100,82 @@ class RewardModelCLIP:
     # -------- 输入适配 --------
     def _prep_pixel_values(self, imgs):
         """
-        输出符合 CLIP 要求的 pixel_values：
-        shape [b,3,224,224] & 已经归一化到 [-1,1]
+        返回符合 CLIP 要求的 pixel_values：
+        - 如果已经是 vision_tower 的 pixel_values（≈ [-1, 1]），直接返回到 device/dtype；
+        - 否则把输入规范到 [0,1] 再交给 self.processor，最后返回到 device/dtype。
         """
+        def _is_vision_pixel_values(x: torch.Tensor) -> bool:
+            # 经验性判断：已标准化到大约 [-1,1]（min<0 且 max<=1.05）
+            # 兼容少量数值抖动
+            return x.dtype.is_floating_point and x.min() < 0.0 and x.max() <= 1.05
+
+        def _to_float32(x: torch.Tensor) -> torch.Tensor:
+            if x.dtype in (torch.bfloat16, torch.float16):
+                return x.to(torch.float32)
+            return x if x.dtype == torch.float32 else x.to(torch.float32)
+
+        # --- Tensor 批输入 ---
         if isinstance(imgs, torch.Tensor):
-            # 已经是 vision_tower 的 pixel_values (≈ [-1,1])
-            if imgs.min() < 0:
+            # case A: 已经是 vision_tower 的 [-1,1] 像素
+            if _is_vision_pixel_values(imgs):
                 return imgs.to(self.device).to(self.model.dtype)
 
-            # raw 0~1 / 0~255 Tensor -> 交给 processor 处理
-            pv = self.processor(images=imgs, return_tensors="pt")["pixel_values"]
+            # case B: 原始图像张量，需要通过 processor
+            x = _to_float32(imgs)
+            x_min = float(x.min())
+            x_max = float(x.max())
+
+            # 规范到 [0,1]
+            if x_max > 1.0:
+                if x_min >= 0.0 and x_max <= 255.0:
+                    x = torch.clamp(x / 255.0, 0.0, 1.0)
+                else:
+                    # 值域异常，直接裁剪
+                    x = torch.clamp(x, 0.0, 1.0)
+            else:
+                # 已经在 [0,1]，保持不变；若有轻微越界也裁剪
+                if x_min < 0.0 or x_max > 1.0:
+                    x = torch.clamp(x, 0.0, 1.0)
+
+            pv = self.processor(images=x, return_tensors="pt")["pixel_values"]
             return pv.to(self.device).to(self.model.dtype)
 
-        # PIL list
-        pv = self.processor(images=imgs, return_tensors="pt")["pixel_values"]
+        # --- 列表输入（PIL / Tensor 混合） ---
+        proc_inputs = []
+        is_all_vision_pixel_values = True
+        for im in imgs:
+            if isinstance(im, torch.Tensor):
+                if _is_vision_pixel_values(im):
+                    # 已是 [-1,1]，直接保留（不进 processor）
+                    proc_inputs.append(im)
+                else:
+                    is_all_vision_pixel_values = False
+                    t = _to_float32(im)
+                    t_min = float(t.min())
+                    t_max = float(t.max())
+                    if t_max > 1.0:
+                        if t_min >= 0.0 and t_max <= 255.0:
+                            t = torch.clamp(t / 255.0, 0.0, 1.0)
+                        else:
+                            t = torch.clamp(t, 0.0, 1.0)
+                    else:
+                        if t_min < 0.0 or t_max > 1.0:
+                            t = torch.clamp(t, 0.0, 1.0)
+                    proc_inputs.append(t)
+            else:
+                # PIL.Image / numpy 之类，交给 processor 处理
+                is_all_vision_pixel_values = False
+                proc_inputs.append(im)
+
+        if is_all_vision_pixel_values:
+            # 全部都是已经标准化的 pixel_values（罕见但支持）
+            batch = torch.stack(proc_inputs, dim=0) if isinstance(proc_inputs[0], torch.Tensor) else proc_inputs
+            return batch.to(self.device).to(self.model.dtype)
+
+        # 需要 processor 的路径（支持 PIL / 0~1 Tensor）
+        pv = self.processor(images=proc_inputs, return_tensors="pt")["pixel_values"]
         return pv.to(self.device).to(self.model.dtype)
+
 
 
 # --------------------  RewardModelBLIP_ITR  --------------------
@@ -218,7 +281,6 @@ class RewardModelDistinctiveness:
 # -----------------------------------------------------------------------------#
 # 2. Generation utilities
 # -----------------------------------------------------------------------------#
-@torch.no_grad()
 def generate_group_responses(
     model: torch.nn.Module,
     inputs: Dict[str, torch.Tensor],
@@ -264,12 +326,13 @@ def generate_group_responses(
         accel_ops.convert_to_fp32 = lambda x: x
 
     with torch.cuda.amp.autocast(dtype=dtype, enabled=use_amp):
-        outputs = base_model.generate(
-            input_ids,
-            **({"attention_mask": attn} if (attn is not None and "images" not in extra) else {}),
-            **extra,
-            **generation_kwargs,
-        )
+        with torch.no_grad():
+            outputs = base_model.generate(
+                input_ids,
+                **({"attention_mask": attn} if (attn is not None and "images" not in extra) else {}),
+                **extra,
+                **generation_kwargs,
+            )
 
     if was_training:
         model.train()
@@ -322,7 +385,6 @@ def _build_forward_inputs(
     return model_inputs, L
 
 
-@torch.no_grad()
 def compute_group_log_probs(
     model: torch.nn.Module,
     generations: torch.LongTensor,          # [B, G, L]
@@ -441,3 +503,197 @@ def grpo_stable_loss(
 
     total_loss = policy_loss + kl_loss
     return total_loss, policy_loss.detach(), kl_loss.detach()
+
+
+# -----------------------------------------------------------------------------#
+# 5. CaRPO Components: Calibration+Risk, Rank-first, PR-MD with KL control
+# -----------------------------------------------------------------------------#
+
+class CalibratedRewardAggregator(nn.Module):
+    """
+    维护每个 RM 的 EMA μ/σ，做 z-score 校准；
+    融合并加上风险惩罚（组内方差）。
+
+    输入: s_bgk ∈ [B,G,K]
+    输出: fused ∈ [B,G], rm_var ∈ [B,G], z_bgk ∈ [B,G,K]
+    """
+    def __init__(
+        self,
+        K: int,
+        alphas: List[float],
+        risk_lambda: float = 0.2,
+        ema_m: float = 0.95,
+        eps: float = 1e-6,
+        clamp: float | None = None,
+        use_tanh: bool = False,
+    ) -> None:
+        super().__init__()
+        self.K = int(K)
+        self.register_buffer("mu", torch.zeros(self.K))
+        self.register_buffer("var", torch.ones(self.K))
+        self.register_buffer("_prev_mu", torch.zeros(self.K))
+        self.register_buffer("_prev_sigma", torch.ones(self.K))
+        self.alphas = nn.Parameter(torch.tensor(alphas, dtype=torch.float32), requires_grad=False)
+        self.risk_lambda = float(risk_lambda)
+        self.m = float(ema_m)
+        self.eps = float(eps)
+        self.clamp = clamp
+        self.use_tanh = bool(use_tanh)
+
+    @torch.no_grad()
+    def _ddp_reduce_mean_var(self, mean: torch.Tensor, var: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if dist.is_available() and dist.is_initialized():
+            world = dist.get_world_size()
+            dist.all_reduce(mean, op=dist.ReduceOp.SUM)
+            dist.all_reduce(var, op=dist.ReduceOp.SUM)
+            mean = mean / world
+            var = var / world
+        return mean, var
+
+    @torch.no_grad()
+    def update_stats(self, s_bgk: torch.Tensor) -> None:
+        # s_bgk: [B,G,K] on some device
+        # 记录上一次用于 RSD
+        self._prev_mu.copy_(self.mu)
+        self._prev_sigma.copy_(torch.sqrt(self.var + self.eps))
+
+        mean = s_bgk.mean(dim=(0, 1))  # [K]
+        var = s_bgk.var(dim=(0, 1), unbiased=False)  # [K]
+        mean, var = self._ddp_reduce_mean_var(mean.detach(), var.detach())
+
+        # EMA 原地更新，保持 buffer 身份
+        self.mu.mul_(self.m).add_(mean * (1.0 - self.m))
+        self.var.mul_(self.m).add_(var * (1.0 - self.m))
+
+    def forward(self, s_bgk: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # 将 alphas 放到正确 device/dtype
+        if self.alphas.device != s_bgk.device:
+            self.alphas.data = self.alphas.data.to(s_bgk.device)
+
+        self.update_stats(s_bgk)
+        sigma = torch.sqrt(self.var + self.eps)  # [K]
+        z = (s_bgk - self.mu) / sigma  # [B,G,K]
+        fused = (z * self.alphas).sum(dim=-1)  # [B,G]
+        rm_var = z.var(dim=-1, unbiased=False)  # [B,G]
+        fused = fused - self.risk_lambda * rm_var
+        if self.clamp is not None:
+            fused = fused.clamp(-self.clamp, self.clamp)
+        if self.use_tanh:
+            fused = torch.tanh(fused)
+        return fused, rm_var, z
+
+    @torch.no_grad()
+    def rsd(self) -> torch.Tensor:
+        """返回 RSD 指标：sum_k(|Δμ_k| + |Δσ_k|)。"""
+        sigma = torch.sqrt(self.var + self.eps)
+        return (self.mu - self._prev_mu).abs().sum() + (sigma - self._prev_sigma).abs().sum()
+
+
+def group_dpo_loss(
+    seq_logp_new: torch.Tensor,  # [B,G]
+    seq_logp_ref: torch.Tensor,  # [B,G]
+    rewards_bg: torch.Tensor,    # [B,G]
+    *,
+    beta_rank: float = 0.1,
+    topk: int = 1,
+    pair_cap: int = 2048,
+) -> Tuple[torch.Tensor, int]:
+    B, G = seq_logp_new.shape
+    k = min(int(topk), G)
+    top_vals, top_idx = rewards_bg.topk(k=k, dim=1)
+
+    pairs: List[Tuple[int, int, int]] = []
+    for b in range(B):
+        winners = set(top_idx[b].tolist())
+        for w in winners:
+            for l in range(G):
+                if l not in winners:
+                    pairs.append((b, w, l))
+    if len(pairs) == 0:
+        return seq_logp_new.new_zeros(()), 0
+    if len(pairs) > pair_cap:
+        pairs = random.sample(pairs, pair_cap)
+
+    device = seq_logp_new.device
+    dtype = seq_logp_new.dtype
+    idx = torch.tensor(pairs, device=device, dtype=torch.long)
+    b_idx, w_idx, l_idx = idx[:, 0], idx[:, 1], idx[:, 2]
+
+    wn = seq_logp_new[b_idx, w_idx]
+    ln = seq_logp_new[b_idx, l_idx]
+    wr = seq_logp_ref[b_idx, w_idx]
+    lr = seq_logp_ref[b_idx, l_idx]
+
+    dpo_arg = beta_rank * ((wn - wr) - (ln - lr))
+    loss = F.softplus(-dpo_arg).mean()
+    return loss.to(dtype), len(pairs)
+
+
+def grpo_rl_loss(
+    logp_new_bg: torch.Tensor,   # [B,G]
+    logp_ref_bg: torch.Tensor,   # [B,G]
+    fused_bg: torch.Tensor,      # [B,G]
+    *,
+    mode: str = "adv",
+    tau: float = 0.4,
+    clip_c: float = 1.5,
+    baseline: str = "group_mean",
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    with torch.no_grad():
+        if baseline == "group_mean":
+            b = fused_bg.mean(dim=1, keepdim=True)
+        else:
+            b = fused_bg.mean()
+        if mode == "soft":
+            w = torch.exp((fused_bg - b) / tau)
+        else:
+            x = fused_bg - fused_bg.mean()
+            x = x / (fused_bg.std(unbiased=False) + 1e-6)
+            x = x.clamp(-clip_c, clip_c)
+            w = torch.exp(x)
+        ess = (w.sum() ** 2) / (w.pow(2).sum() + 1e-8)
+
+    pg_loss = -(w.detach() * logp_new_bg).mean()
+    approx_kl = (logp_new_bg - logp_ref_bg).mean()
+    return pg_loss, approx_kl, float(ess.detach().cpu().item())
+
+
+@torch.no_grad()
+def estimate_true_kl_per_token(
+    tok_logp_new: torch.Tensor,  # [B,G,T]
+    tok_logp_ref: torch.Tensor,  # [B,G,T]
+    lengths: torch.Tensor,       # [B,G]
+) -> float:
+    diff = tok_logp_new - tok_logp_ref  # [B,G,T]
+    T = diff.size(-1)
+    device = diff.device
+    rng = torch.arange(T, device=device)[None, None, :]
+    mask = rng < lengths[..., None]
+    s = (diff * mask).sum(dim=-1)  # [B,G]
+    n = lengths.clamp_min(1)
+    kl_tok = (s / n).mean()
+    return float(kl_tok.detach().cpu().item())
+
+
+class KLController:
+    def __init__(
+        self,
+        target: float = 0.02,
+        up: float = 1.5,
+        down: float = 0.67,
+        beta_min: float = 1e-4,
+        beta_max: float = 1.0,
+    ) -> None:
+        self.target = float(target)
+        self.up = float(up)
+        self.down = float(down)
+        self.beta_min = float(beta_min)
+        self.beta_max = float(beta_max)
+
+    def step(self, kl_token: float, beta: float) -> float:
+        if kl_token > 1.5 * self.target:
+            beta = min(beta * self.up, self.beta_max)
+        elif kl_token < 0.5 * self.target:
+            beta = max(beta * self.down, self.beta_min)
+        return beta
+

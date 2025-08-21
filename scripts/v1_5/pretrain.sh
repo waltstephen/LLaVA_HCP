@@ -1,6 +1,6 @@
 #!/bin/bash
 
-deepspeed --master_port 29650 --include localhost:0,1,2,3 llava/train/train_mem.py \
+deepspeed --master_port 29650 --include localhost:0,1,2,3,4,5,6,7 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path lmsys/vicuna-7b-v1.5 \
     --version plain \
@@ -8,12 +8,12 @@ deepspeed --master_port 29650 --include localhost:0,1,2,3 llava/train/train_mem.
     --image_folder ./playground/data/LLaVA-Pretrain/images \
     --vision_tower openai/clip-vit-large-patch14-336 \
     --mm_projector_type mlp2x_gelu \
-    --tune_mm_mlp_adapter True \
+    --tune_mm_mlp_adapter False \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --bf16 True \
-    --output_dir ./checkpoints/llava-v1.5-7b-pretrain-0726 \
+    --output_dir ./checkpoints/llava-v1.5-7b-pretrain-0814 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
@@ -34,11 +34,33 @@ deepspeed --master_port 29650 --include localhost:0,1,2,3 llava/train/train_mem.
     --lazy_preprocess True \
     --report_to wandb \
     --rl_grpo \
-    --rl_group_size 8 \
+    --rl_group_size 6 \
     --grpo_mode adv \
-    --grpo_tau 0.15 \
-    --grpo_clip 5.0 \
-    --kl_beta 0.3 \
+    --grpo_tau 0.4 \
+    --grpo_clip 1.5 \
+    --beta_rank 0.1 \
+    --pair_topk 1 \
+    --pair_cap 2048 \
+    --reward_alphas 0.6 0.3 0.1 \
+    --risk_lambda 0.2 \
+    --ema_m 0.95 \
+    --rank_warmup_steps 800 \
+    --rank_weight 0.5 \
+    --rl_weight 0.5 \
+    --kl_beta_init 0.05 \
+    --target_kl_token 0.02 \
+    --kl_beta_min 1e-4 \
+    --kl_beta_max 0.5 \
+    --short_threshold 8 \
+    --lambda_empty 1.0 \
+    --lambda_len 0.05 \
+    --temperature 0.7 \
+    --ess_target_ratio 0.6 \
+    --ess_tolerance 0.1 \
+    --temperature_min 0.3 \
+    --temperature_max 1.5 \
+    --temperature_up 1.07 \
+    --temperature_down 0.93 \
     --sample_log_freq 50 \
     --sample_log_n 4 \
-    --pretrain_mm_mlp_adapter ./checkpoints/llava-v1.5-7b-pretrain/mm_projector.bin
+    --pretrain_mm_mlp_adapter ./checkpoints/llava_1_5_projecter/mm_projector.bin

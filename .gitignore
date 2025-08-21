@@ -32,6 +32,9 @@ ckpts*
 !.devcontainer/*
 
 /playground
+/build
+/checkpoints
+/wandb
 
 # Demo
 serve_images/
