@@ -38,6 +38,8 @@ ckpts*
 /LLaVA-NeXT-Data
 /cuda_memory_allocate
 /VLMEvalKit
+/data
 
 # Demo
 serve_images/
+data/MME_Benchmark_release_version.zip
