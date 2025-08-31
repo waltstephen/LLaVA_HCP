@@ -35,6 +35,9 @@ ckpts*
 /build
 /checkpoints
 /wandb
+/LLaVA-NeXT-Data
+/cuda_memory_allocate
+/VLMEvalKit
 
 # Demo
 serve_images/

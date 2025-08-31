@@ -56,6 +56,7 @@ class ModelArguments:
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
+    llm_init_from_path: Optional[str] = field(default=None)
     vision_tower: Optional[str] = field(default=None)
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
@@ -110,6 +111,7 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    save_full_model: bool = field(default=False)
 
 @dataclass
 class LLaVARLArguments:
@@ -270,6 +272,18 @@ def find_all_linear_names(model):
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                                    output_dir: str):
     """Collects the state dict and dump to disk."""
+
+    if getattr(trainer.args, "save_full_model", False):
+        if trainer.deepspeed:
+            torch.cuda.synchronize()
+            trainer.save_model(output_dir)
+            return
+        state_dict = trainer.model.state_dict()
+        if trainer.args.should_save:
+            cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+            del state_dict
+            trainer._save(output_dir, state_dict=cpu_state_dict)
+        return
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
@@ -947,6 +961,19 @@ def train(attn_implementation=None):
         )
     model.config.use_cache = False
 
+    # Optionally initialize LLM weights from an external pretrained path and freeze LLM
+    if getattr(model_args, "llm_init_from_path", None):
+        src = model_args.llm_init_from_path
+        try:
+            base = transformers.LlamaForCausalLM.from_pretrained(src, torch_dtype=model.dtype)
+            sd = base.state_dict()
+            # load into the language submodule only (keep vision/projector intact)
+            missing, unexpected = model.model.load_state_dict({k: v for k, v in sd.items() if k.startswith(())} , strict=False)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load external LLM weights from {src}: {e}")
+        # freeze LLM backbone, keep projector trainable when tune_mm_mlp_adapter=True
+        model.model.requires_grad_(False)
+
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
@@ -1031,6 +1058,12 @@ def train(attn_implementation=None):
 
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
         if model_args.tune_mm_mlp_adapter:
+            model.requires_grad_(False)
+            for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = True
+
+        if getattr(model_args, "llm_init_from_path", None):
+            # Freeze everything, unfreeze projector only
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True

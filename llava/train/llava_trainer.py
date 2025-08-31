@@ -589,8 +589,33 @@ class LLaVATrainer(Trainer):
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
 
+    def _sanitize_generation_config_for_save(self):
+        """
+        修正无效的 generation_config 组合，避免保存时报错：
+        - 若 do_sample=False 但 temperature/top_p/top_k/typical_p 等启用了采样配置，则强制 do_sample=True
+        """
+        try:
+            gen_cfg = getattr(self.model, "generation_config", None)
+            if gen_cfg is None:
+                return
+            needs_sampling = False
+            if hasattr(gen_cfg, "temperature") and gen_cfg.temperature is not None and gen_cfg.temperature != 1.0:
+                needs_sampling = True
+            if hasattr(gen_cfg, "top_p") and gen_cfg.top_p is not None and gen_cfg.top_p < 1.0:
+                needs_sampling = True
+            if hasattr(gen_cfg, "top_k") and gen_cfg.top_k is not None and gen_cfg.top_k > 0:
+                needs_sampling = True
+            if hasattr(gen_cfg, "typical_p") and gen_cfg.typical_p is not None and gen_cfg.typical_p < 1.0:
+                needs_sampling = True
+            if hasattr(gen_cfg, "do_sample") and needs_sampling and not gen_cfg.do_sample:
+                gen_cfg.do_sample = True
+        except Exception:
+            # 不因清理失败影响训练保存流程
+            pass
+
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             pass
         else:
+            self._sanitize_generation_config_for_save()
             super(LLaVATrainer, self)._save(output_dir, state_dict)

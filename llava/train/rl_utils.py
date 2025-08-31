@@ -17,6 +17,7 @@ from transformers import (
     AutoModel,
     AutoTokenizer,
 )
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 from torchvision import transforms
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX
 
@@ -318,13 +319,6 @@ def generate_group_responses(
     if was_training:
         base_model.eval()
 
-    import accelerate.utils.operations as accel_ops
-
-    # patch: 防止 generate 内部把 logits 转 float32
-    if not hasattr(accel_ops, "_old_convert_to_fp32"):
-        accel_ops._old_convert_to_fp32 = accel_ops.convert_to_fp32
-        accel_ops.convert_to_fp32 = lambda x: x
-
     with torch.cuda.amp.autocast(dtype=dtype, enabled=use_amp):
         with torch.no_grad():
             outputs = base_model.generate(
@@ -405,18 +399,15 @@ def compute_group_log_probs(
     )
 
     with torch.cuda.amp.autocast(dtype=dtype, enabled=use_amp):
-        logits = model(**model_inputs).logits[:, :-1]        # [B·G,S+L-1,V]
+        logits = model(**model_inputs).logits[:, :-1]
+    logits = logits.to(torch.float32)
 
     labels = model_inputs["input_ids"][:, 1:].clone()        # align
     ignore_mask = labels.eq(IMAGE_TOKEN_INDEX)
     labels[ignore_mask] = IGNORE_INDEX
     gather_idx = labels.masked_fill(labels.eq(IGNORE_INDEX), 0)
 
-    token_logp = (
-        logits.log_softmax(-1)
-        .gather(2, gather_idx.unsqueeze(-1))
-        .squeeze(-1)
-    )
+    token_logp = (logits.log_softmax(-1).gather(2, gather_idx.unsqueeze(-1)).squeeze(-1))
     token_logp[ignore_mask] = 0.0
 
     sent_logp = token_logp[:, -L:].sum(-1).view(B, G)
@@ -444,17 +435,14 @@ def compute_group_token_log_probs(
 
     with torch.cuda.amp.autocast(dtype=dtype, enabled=use_amp):
         logits = model(**model_inputs).logits[:, :-1]
+    logits = logits.to(torch.float32)
 
     labels = model_inputs["input_ids"][:, 1:].clone()
     ignore_mask = labels.eq(IMAGE_TOKEN_INDEX)
     labels[ignore_mask] = IGNORE_INDEX
     gather_idx = labels.masked_fill(labels.eq(IGNORE_INDEX), 0)
 
-    token_logp = (
-        logits.log_softmax(-1)
-        .gather(2, gather_idx.unsqueeze(-1))
-        .squeeze(-1)
-    )
+    token_logp = (logits.log_softmax(-1).gather(2, gather_idx.unsqueeze(-1)).squeeze(-1))
     token_logp[ignore_mask] = 0.0
     token_logp = token_logp[:, -L:].view(B, G, L)            # 只留生成段
     return token_logp

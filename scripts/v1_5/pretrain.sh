@@ -1,28 +1,30 @@
 #!/bin/bash
 
-deepspeed --master_port 29650 --include localhost:0,1,2,3,4,5,6,7 llava/train/train_mem.py \
+deepspeed --master_port 29650 --include localhost:0,2,3,4,5,6,7,8 llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path lmsys/vicuna-7b-v1.5 \
-    --version plain \
+    --version qwen_2_5 \
     --data_path ./playground/data/LLaVA-Pretrain/blip_laion_cc_sbu_558k.json \
     --image_folder ./playground/data/LLaVA-Pretrain/images \
     --vision_tower openai/clip-vit-large-patch14-336 \
     --mm_projector_type mlp2x_gelu \
     --tune_mm_mlp_adapter False \
+    --llm_init_from_path /home/jusheng/yijia/LLaVA_HCP/checkpoints/llava-v1.5-7b \
+    --save_full_model True \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --bf16 True \
-    --output_dir ./checkpoints/llava-v1.5-7b-pretrain-0814 \
+    --output_dir ./checkpoints/llava-v1.5-7b-pretrain-0825 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 24000 \
+    --save_steps 10000 \
     --save_total_limit 1 \
-    --learning_rate 1e-7 \
+    --learning_rate 2e-6 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
@@ -63,4 +65,5 @@ deepspeed --master_port 29650 --include localhost:0,1,2,3,4,5,6,7 llava/train/tr
     --temperature_down 0.93 \
     --sample_log_freq 50 \
     --sample_log_n 4 \
+    --max_grad_norm 10 \
     --pretrain_mm_mlp_adapter ./checkpoints/llava_1_5_projecter/mm_projector.bin

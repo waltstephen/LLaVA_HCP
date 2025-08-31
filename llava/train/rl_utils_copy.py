@@ -15,6 +15,7 @@ from transformers import (
     AutoModel,
     AutoTokenizer,
 )
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 from torchvision import transforms
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX
 
@@ -256,14 +257,27 @@ def generate_group_responses(
     if was_training:
         base_model.eval()
 
-    import accelerate.utils.operations as accel_ops
+    class CleanLogitsProcessor(LogitsProcessor):
+        def __init__(self, clamp_value: float = 50.0) -> None:
+            self.clamp_value = float(clamp_value)
 
-    # patch: 防止 generate 内部把 logits 转 float32
-    if not hasattr(accel_ops, "_old_convert_to_fp32"):
-        accel_ops._old_convert_to_fp32 = accel_ops.convert_to_fp32
-        accel_ops.convert_to_fp32 = lambda x: x
+        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+            original_scores = scores
+            scores = scores.to(dtype=torch.float32)
+            scores = torch.clamp(scores, min=-self.clamp_value, max=self.clamp_value)
+            finite_mask = torch.isfinite(scores)
+            scores = torch.where(finite_mask, scores, torch.full_like(scores, -float("inf")))
+            row_all_masked = torch.isneginf(scores).all(dim=-1)
+            if row_all_masked.any():
+                idx = original_scores[row_all_masked].argmax(dim=-1)
+                scores[row_all_masked] = -float("inf")
+                scores[row_all_masked, idx] = 0.0
+            return scores.to(dtype=original_scores.dtype)
 
-    with torch.cuda.amp.autocast(dtype=dtype, enabled=use_amp):
+    processors = LogitsProcessorList([CleanLogitsProcessor()])
+    generation_kwargs["logits_processor"] = processors
+
+    with torch.cuda.amp.autocast(enabled=False):
         outputs = base_model.generate(
             input_ids,
             **({"attention_mask": attn} if (attn is not None and "images" not in extra) else {}),

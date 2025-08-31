@@ -13,6 +13,7 @@ from llava.constants import (
 )
 from llava.mm_utils import process_images, tokenizer_image_token
 from llava.model.builder import load_pretrained_model
+from llava.model.multimodal_encoder.builder import build_vision_tower
 
 
 def get_model_name_from_path(model_path):
@@ -87,6 +88,7 @@ def run_inference(
     projector_ckpt_path: str,
     image_path: str,
     prompt: str,
+    vision_tower_path: str | None = None,
     device: str = "cuda",
     max_new_tokens: int = 256,
     temperature: float = 0.0,
@@ -102,6 +104,27 @@ def run_inference(
 
     # Replace projector
     load_projector_weights(model, projector_ckpt_path)
+
+    # Force bind the specified CLIP vision tower if provided
+    if vision_tower_path is not None and len(str(vision_tower_path)) > 0:
+        try:
+            core_model = model.get_model()
+        except Exception:
+            core_model = model
+        # Update config and rebuild vision tower
+        setattr(core_model.config, "mm_vision_tower", vision_tower_path)
+        vt = build_vision_tower(core_model.config)
+        vt.load_model()
+        # Align device and dtype with language model
+        model_dtype = next(model.parameters()).dtype
+        vt.to(device=device, dtype=model_dtype)
+        # Attach to model and refresh image_processor
+        try:
+            core_model.vision_tower = vt
+        except Exception:
+            # Some wrappers keep it on model
+            setattr(model, "vision_tower", vt)
+        image_processor = vt.image_processor
 
     model.to(device)
     model.eval()
@@ -183,7 +206,7 @@ def parse_args():
     parser.add_argument(
         "--projector_ckpt_path",
         type=str,
-        default="/home/jusheng/yijia/LLaVA_HCP/checkpoints/llava-v1.5-7b-pretrain-0814/checkpoint-48000/mm_projector.bin",
+        default="/home/jusheng/yijia/LLaVA_HCP/checkpoints/llava_1_5_projecter/mm_projector.bin",
         help="Path to the trained projector checkpoint (.bin).",
     )
     parser.add_argument(
@@ -195,8 +218,14 @@ def parse_args():
     parser.add_argument(
         "--prompt",
         type=str,
-        default="请描述这张图片。",
+        default="Please Describle this image",
         help="User text prompt to ask the model about the image.",
+    )
+    parser.add_argument(
+        "--vision_tower_path",
+        type=str,
+        default="/home/jusheng/yijia/LLaVA_HCP/checkpoints/clip-vit-large-patch14-336",
+        help="Path to CLIP vision tower (e.g., clip-vit-large-patch14-336).",
     )
     parser.add_argument(
         "--device",
@@ -226,6 +255,7 @@ if __name__ == "__main__":
         projector_ckpt_path=args.projector_ckpt_path,
         image_path=args.image_path,
         prompt=args.prompt,
+        vision_tower_path=args.vision_tower_path,
         device=args.device,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
